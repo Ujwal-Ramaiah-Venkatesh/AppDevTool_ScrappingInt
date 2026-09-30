@@ -34,6 +34,37 @@ from openpyxl.utils import get_column_letter
 
 PLACES_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 
+# --- Free (no-key) data sources: OpenStreetMap -------------------------------
+# Overpass = business POIs; Nominatim = geocoding area names to lat/lng.
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# Mirrors tried in order when one is overloaded (504) or times out.
+OVERPASS_MIRRORS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+)
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+# Nominatim requires a real User-Agent identifying the app.
+USER_AGENT = "ScrappingTool-LeadFinder/1.0 (local business research)"
+
+# OSM tags that identify a "business" worth prospecting, mapped to a label.
+OSM_AMENITIES = (
+    "restaurant|cafe|fast_food|bar|pub|food_court|ice_cream|"
+    "clinic|doctors|dentist|pharmacy|veterinary|"
+    "car_rental|car_wash|driving_school|"
+    "cinema|nightclub"
+)
+OSM_TOURISM = "hotel|guest_house|motel|hostel|apartment|resort"
+
+# Amenity/office values that are NOT website-pitch prospects (chains, govt, etc.).
+OSM_EXCLUDE_AMENITY = {
+    "bank", "atm", "bureau_de_change", "post_office", "townhall", "courthouse",
+    "police", "fire_station", "prison", "public_building", "community_centre",
+    "school", "college", "university", "kindergarten", "hospital", "fuel",
+    "place_of_worship", "toilets", "parking", "bus_station", "fountain",
+}
+OSM_EXCLUDE_OFFICE = {"government", "administrative", "diplomatic"}
+
 # Max radius the Places API allows for a circular restriction (meters).
 MAX_RADIUS_M = 50000
 
@@ -120,6 +151,7 @@ class Config:
     categories: list[str]
     enrich_emails: bool
     output_csv: str
+    data_source: str = "osm"  # "osm" (free) or "google" (needs API key)
     area: str = ""
     areas: list[str] = field(default_factory=list)
     center_lat: float | None = None
@@ -141,6 +173,7 @@ def load_config(path: str) -> Config:
         categories=list(raw.get("categories", [])),
         enrich_emails=bool(raw.get("enrich_emails", True)),
         output_csv=str(raw.get("output_csv", "leads.csv")).strip(),
+        data_source=str(raw.get("data_source", "osm")).strip().lower(),
         area=str(raw.get("area", "")).strip(),
         areas=[str(a).strip() for a in (raw.get("areas") or []) if str(a).strip()],
         center_lat=raw.get("center_lat"),
@@ -161,29 +194,32 @@ def classify_website(website: str) -> tuple[str, str]:
 
 
 def geocode_area(area: str, cfg: Config) -> tuple[float, float] | None:
-    """Geocode one locality/landmark string to (lat, lng) via Places search."""
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": cfg.api_key,
-        "X-Goog-FieldMask": "places.location,places.formattedAddress",
-    }
-    resp = requests.post(
-        PLACES_SEARCH_URL,
-        headers=headers,
-        json={"textQuery": area, "pageSize": 1},
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        print(f"  ! Could not geocode '{area}': {resp.status_code} {resp.text[:150]}", file=sys.stderr)
+    """Geocode one locality/landmark to (lat, lng) using free Nominatim (OSM)."""
+    try:
+        resp = requests.get(
+            NOMINATIM_URL,
+            params={
+                "q": area,
+                "format": "json",
+                "limit": 1,
+                "countrycodes": "in",
+                # Bias toward the Bangalore metro to avoid same-name mismatches.
+                "viewbox": "77.35,13.25,77.85,12.75",
+                "bounded": 1,
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        print(f"  ! Geocode request failed for '{area}': {exc}", file=sys.stderr)
         return None
-    places = resp.json().get("places", [])
-    if not places:
+    if resp.status_code != 200 or not resp.json():
+        print(f"  ! Could not geocode '{area}': {resp.status_code}", file=sys.stderr)
         return None
-    loc = places[0].get("location", {})
-    lat, lng = loc.get("latitude"), loc.get("longitude")
-    if lat is None or lng is None:
-        return None
-    return float(lat), float(lng)
+    top = resp.json()[0]
+    # Nominatim asks for max ~1 request/second.
+    time.sleep(1)
+    return float(top["lat"]), float(top["lon"])
 
 
 def resolve_centers(cfg: Config) -> list[tuple[str, float, float]]:
@@ -292,7 +328,7 @@ def place_to_lead(place: dict, category: str) -> Lead:
     )
 
 
-def collect_leads(cfg: Config) -> list[Lead]:
+def collect_leads_google(cfg: Config) -> list[Lead]:
     seen_ids: set[str] = set()
     seen_phones: set[str] = set()
     leads: list[Lead] = []
@@ -334,9 +370,154 @@ def collect_leads(cfg: Config) -> list[Lead]:
     return leads
 
 
+def _osm_category(tags: dict) -> str:
+    """Human label for an OSM element from its primary classifying tag."""
+    for key in ("shop", "amenity", "tourism", "office", "craft", "healthcare", "leisure"):
+        if tags.get(key):
+            return str(tags[key]).replace("_", " ")
+    return "business"
+
+
+def _osm_address(tags: dict) -> str:
+    parts = [
+        tags.get("addr:housenumber", ""),
+        tags.get("addr:street", ""),
+        tags.get("addr:suburb", ""),
+        tags.get("addr:city", ""),
+        tags.get("addr:postcode", ""),
+    ]
+    return ", ".join(p for p in parts if p).strip(", ")
+
+
+def element_to_lead(el: dict) -> Lead | None:
+    tags = el.get("tags", {})
+    name = (tags.get("name") or "").strip()
+    if not name:
+        return None  # unnamed POIs aren't usable leads
+
+    # Skip non-prospects (banks, government, schools, fuel, chains-ish).
+    if tags.get("amenity") in OSM_EXCLUDE_AMENITY:
+        return None
+    if tags.get("office") in OSM_EXCLUDE_OFFICE:
+        return None
+
+    lat = el.get("lat") or (el.get("center") or {}).get("lat")
+    lon = el.get("lon") or (el.get("center") or {}).get("lon")
+    website = (tags.get("website") or tags.get("contact:website") or "").strip()
+    phone = (tags.get("phone") or tags.get("contact:phone") or tags.get("contact:mobile") or "").strip()
+    email = (tags.get("email") or tags.get("contact:email") or "").strip()
+    status, note = classify_website(website)
+
+    link = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}" if lat and lon else ""
+    osm_id = f"{el.get('type', 'n')}/{el.get('id', '')}"
+
+    return Lead(
+        place_id=osm_id,
+        name=name,
+        category=_osm_category(tags),
+        link=link,
+        website_status=status,
+        phone=phone,
+        email=email,
+        address=_osm_address(tags),
+        source="OpenStreetMap (Overpass)",
+        website=website,
+        notes=note,
+    )
+
+
+def overpass_fetch(lat: float, lng: float, radius_m: float) -> list[dict]:
+    """Query the free Overpass API for business POIs within a radius.
+
+    Tries each mirror in turn on timeout/504 so one busy server doesn't
+    lose the whole area.
+    """
+    r = int(radius_m)
+    query = f"""
+    [out:json][timeout:90];
+    (
+      nwr(around:{r},{lat},{lng})[shop];
+      nwr(around:{r},{lat},{lng})[amenity~"^({OSM_AMENITIES})$"];
+      nwr(around:{r},{lat},{lng})[tourism~"^({OSM_TOURISM})$"];
+      nwr(around:{r},{lat},{lng})[office];
+      nwr(around:{r},{lat},{lng})[craft];
+      nwr(around:{r},{lat},{lng})[leisure=fitness_centre];
+    );
+    out center tags;
+    """
+    for mirror in OVERPASS_MIRRORS:
+        try:
+            resp = requests.post(
+                mirror,
+                data={"data": query},
+                headers={"User-Agent": USER_AGENT},
+                timeout=180,
+            )
+        except requests.RequestException as exc:
+            print(f"  ! {mirror} failed ({exc}); trying next mirror...", file=sys.stderr)
+            continue
+        if resp.status_code == 200:
+            return resp.json().get("elements", [])
+        print(f"  ! {mirror} returned {resp.status_code}; trying next mirror...", file=sys.stderr)
+        time.sleep(3)
+    print("  ! All Overpass mirrors failed for this area.", file=sys.stderr)
+    return []
+
+
+def collect_leads_osm(cfg: Config) -> list[Lead]:
+    seen_ids: set[str] = set()
+    seen_phones: set[str] = set()
+    leads: list[Lead] = []
+
+    centers = resolve_centers(cfg)
+    if not centers:
+        print("ERROR: OSM mode needs at least one area to center on.", file=sys.stderr)
+        return []
+
+    radius_m = min(cfg.radius_km * 1000, MAX_RADIUS_M)
+    print(f"Searching {len(centers)} area(s) within {cfg.radius_km:g} km each (OpenStreetMap).")
+
+    for label, lat, lng in centers:
+        print(f"Querying Overpass around {label}...")
+        elements = overpass_fetch(lat, lng, radius_m)
+        print(f"  {len(elements)} POIs returned.")
+        for el in elements:
+            lead = element_to_lead(el)
+            if lead is None or lead.place_id in seen_ids:
+                continue
+            if lead.phone and lead.phone in seen_phones:
+                continue
+            seen_ids.add(lead.place_id)
+            if lead.phone:
+                seen_phones.add(lead.phone)
+            leads.append(lead)
+        # Be polite to the shared public Overpass instance.
+        time.sleep(2)
+
+    return leads
+
+
+def collect_leads(cfg: Config) -> list[Lead]:
+    if cfg.data_source == "google":
+        return collect_leads_google(cfg)
+    return collect_leads_osm(cfg)
+
+
 def sort_leads(leads: list[Lead]) -> list[Lead]:
-    priority = {"None": 0, "Social-only": 1, "Outdated": 2, "OK": 3}
-    return sorted(leads, key=lambda l: priority.get(l.website_status, 9))
+    """Rank actionable, high-intent leads first.
+
+    Priority: has a phone (contactable) > needs a website > has an email.
+    """
+    status_rank = {"None": 0, "Social-only": 1, "Outdated": 2, "OK": 3}
+    return sorted(
+        leads,
+        key=lambda l: (
+            0 if l.phone else 1,
+            status_rank.get(l.website_status, 9),
+            0 if l.email else 1,
+            l.name.lower(),
+        ),
+    )
 
 
 def write_csv(leads: list[Lead], path: str) -> None:
@@ -399,6 +580,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--radius", type=float, help="Radius in km around the center.")
     parser.add_argument("--count", type=int, help="Override target lead count.")
     parser.add_argument("--out", help="Output file (.xlsx or .csv).")
+    parser.add_argument("--source", choices=["osm", "google"], help="Data source (default from config).")
     parser.add_argument("--no-emails", action="store_true", help="Skip email enrichment.")
     return parser.parse_args()
 
@@ -417,10 +599,13 @@ def main() -> int:
         cfg.target_count = args.count
     if args.out:
         cfg.output_csv = args.out
+    if args.source:
+        cfg.data_source = args.source
     if args.no_emails:
         cfg.enrich_emails = False
 
-    if not cfg.api_key:
+    # Only the Google source needs an API key; OSM is free and keyless.
+    if cfg.data_source == "google" and not cfg.api_key:
         print("ERROR: GOOGLE_MAPS_API_KEY is not set. Copy .env.example to .env and add your key.", file=sys.stderr)
         return 1
     if not cfg.location:
@@ -428,22 +613,26 @@ def main() -> int:
         return 1
 
     leads = collect_leads(cfg)
-    print(f"\nCollected {len(leads)} unique businesses.")
+    print(f"\nCollected {len(leads)} unique businesses (before ranking/cap).")
+
+    # Rank best leads first, then keep only the target count.
+    leads = sort_leads(leads)[: cfg.target_count]
 
     # Email enrichment: fetch each real website once and scan for a public email.
     if cfg.enrich_emails:
         print("Enriching emails from business websites (best-effort)...")
         for lead in leads:
-            if lead.website and lead.website_status == "OK":
+            if lead.website and not lead.email and lead.website_status == "OK":
                 lead.email = extract_email(lead.website)
 
-    leads = sort_leads(leads)
     write_output(leads, cfg.output_csv)
     print(f"Wrote {len(leads)} leads to {cfg.output_csv}")
 
     # Quick summary so you know how many are strong prospects.
     strong = sum(1 for l in leads if l.website_status in ("None", "Social-only"))
+    with_phone = sum(1 for l in leads if l.phone)
     print(f"Strong prospects (no site / social-only): {strong}")
+    print(f"Contactable (has phone): {with_phone}")
     return 0
 
 

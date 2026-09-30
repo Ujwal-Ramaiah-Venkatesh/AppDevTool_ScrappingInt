@@ -1,4 +1,9 @@
 # ---- Search scope -------------------------------------------------------
+# Data source:
+#   osm    = OpenStreetMap via Overpass API — FREE, no key, no billing.
+#   google = Google Places API — richer data, but needs a billed API key.
+data_source: "osm"
+
 # City / region label used in the search text.
 location: "Bangalore, Karnataka, India"
 

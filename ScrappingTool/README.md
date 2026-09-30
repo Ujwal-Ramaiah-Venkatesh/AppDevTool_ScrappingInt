@@ -1,60 +1,64 @@
 # ScrappingTool — Website-Lead Finder
 
 Finds local businesses that likely **need a website** and exports them to an
-**Excel (.xlsx)** sheet you can use for outreach. Uses the **official Google
-Places API (New)** — Google's supported, Terms-compliant way to query business
-listings (no HTML scraping, so you won't get IP-banned).
+**Excel (.xlsx)** sheet for outreach.
 
-Searches within a **radius around your locality** (default: Bangalore,
-Indiranagar, 10 km) and can widen later.
+Two data sources:
+
+- **`osm` (default) — FREE, no API key, no billing.** Uses OpenStreetMap via
+  the Overpass API (business listings) + Nominatim (geocoding). OSM data is
+  open-licensed, so it's fully legal.
+- **`google` — richer data, but needs a billed Google Places API key.**
+
+Searches a **radius around each of your localities** (default: 5 North-East
+Bangalore areas, 10 km each), merges and deduplicates the results.
 
 ## Output columns
 
 `Business Name, Category, Link to Open, Website Status, Contact Number,
 Contact Email, Address / Area, Source, Notes`
 
-Rows are sorted with the **best prospects on top** (`Website Status` = `None`
-or `Social-only`), and the Excel sheet color-codes them (green = no site,
-yellow = social-only) with a frozen header and filters.
+Leads are ranked so the most useful are on top: **contactable (has a phone)**
+first, then **needs a website** (`Website Status` = `None` / `Social-only`).
+The Excel sheet color-codes prospects (green = no site, yellow = social-only)
+with a frozen header and filters.
 
 ## Setup
 
-1. **Get a Google API key** and enable **"Places API (New)"**:
-   https://developers.google.com/maps/documentation/places/web-service/get-api-key
-2. Copy the key into a `.env` file:
-   ```powershell
-   Copy-Item .env.example .env
-   # then edit .env and paste your key
-   ```
-3. Install dependencies:
-   ```powershell
-   pip install -r requirements.txt
-   ```
+```powershell
+pip install -r requirements.txt
+```
+
+That's it for the free `osm` source — no key needed.
+
+(Optional, only for `google`) Get a Places API key, enable "Places API (New)",
+then `Copy-Item .env.example .env` and paste your key into `.env`.
 
 ## Run
 
 ```powershell
-# Uses config.yaml (edit area, radius_km, categories, target_count there)
+# Uses config.yaml (edit areas, radius_km, target_count there)
 python scraper.py
 
-# Or override on the fly — center the 10 km radius on your locality
-python scraper.py --area "Koramangala, Bangalore" --radius 10 --count 200
-python scraper.py --out leads.xlsx
-python scraper.py --no-emails
+# Override on the fly
+python scraper.py --area "Koramangala, Bangalore" --radius 10 --count 300
+python scraper.py --source osm        # free (default)
+python scraper.py --source google     # needs API key
+python scraper.py --no-emails         # faster; skip email scan
 ```
 
 The sheet is written to `leads.xlsx` (opens directly in Excel). Use a `.csv`
-name in `--out` or `output_csv` if you prefer plain CSV.
+name in `--out` or `output_csv` for plain CSV.
 
-## Important notes
+## Notes
 
-- **Emails:** The Places API does **not** return emails. When `enrich_emails`
-  is on, the tool fetches each business's own public website and scans for a
-  visible email. It **never invents** an address — blanks stay blank.
-- **Website Status = OK** just means a site exists. Detecting "outdated /
-  not mobile-friendly" reliably needs a manual look — that's your judgment call.
-- **Cost:** Places API is pay-as-you-go with a monthly free tier. 200 leads is
-  well within typical free credits, but check your Google Cloud billing.
+- **Never fabricates.** Missing phone/email cells stay blank.
+- **Website Status = OK** only means a site exists; judging "outdated /
+  not mobile-friendly" needs a manual look.
+- **OSM coverage** varies — many small shops have a name + phone but no email.
+  The ranking pushes the contactable ones to the top.
+- **Overpass** is a shared free service; if an area returns a 429/504, the tool
+  retries other mirrors. Re-run later if a busy area is skipped.
 - **Outreach law:** Contacting businesses on publicly listed numbers is
   generally low-risk, but cold email/calls are regulated (India DPDP Act,
   GDPR, CAN-SPAM). Always offer an opt-out and don't spam.
