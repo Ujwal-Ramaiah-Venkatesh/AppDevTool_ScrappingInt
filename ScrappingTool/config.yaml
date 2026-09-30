@@ -1,0 +1,45 @@
+# ---- Search scope -------------------------------------------------------
+# City / region label used in the search text.
+location: "Bangalore, Karnataka, India"
+
+# Your localities — the radius is centered on EACH of these (auto-geocoded).
+# Results across all areas are merged and deduplicated.
+areas:
+  - "Kalyan Nagar, Bangalore"
+  - "Nagavara, Bangalore"
+  - "Hebbal, Bangalore"
+  - "Hennur, Bangalore"
+  - "Kothanur, Bangalore"
+
+# Radius in km around each area. Start at 10, widen later.
+radius_km: 10
+
+# Optional: set exact coordinates to skip geocoding (overrides `areas`).
+# center_lat: 13.0250
+# center_lng: 77.6400
+
+# How many leads (roughly) you want in total across all areas/categories.
+target_count: 200
+
+# Business types to search for. Add/remove freely.
+categories:
+  - "restaurants"
+  - "cafes"
+  - "hotels"
+  - "guesthouses"
+  - "retail shops"
+  - "salons"
+  - "clinics"
+  - "gyms"
+  - "real estate agents"
+  - "plumbers"
+  - "electricians"
+  - "tutors"
+
+# ---- Options ------------------------------------------------------------
+# Try to pull a public email by fetching each business's own website
+# (best-effort, slower). Set to false to skip.
+enrich_emails: true
+
+# Output file. Use .xlsx for an Excel sheet, or .csv for plain CSV.
+output_csv: "leads.xlsx"
